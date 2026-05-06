@@ -1,0 +1,22 @@
+# Python cache/artifacts
+__pycache__/
+*.py[cod]
+
+# Virtual env
+.venv/
+
+
+# OS/editor temp
+.DS_Store
+Thumbs.db
+
+# Excel lock/temp files (created while workbook is open)
+~$*.xlsx
+~$*.xls
+output/~$*.xlsx
+output/~$*.xls
+
+# Optional: uncomment if you don't want generated outputs in git
+# output/*.xlsx
+
+.env
