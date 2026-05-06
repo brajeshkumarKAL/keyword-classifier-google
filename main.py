@@ -275,7 +275,7 @@ def translate_keywords_batch(
         "   - 'madhumeh ki ayurvedic dawa' → 'ayurvedic medicine for diabetes'\n"
         "   - 'sugar ke lakshan' → 'symptoms of diabetes'\n"
         "   - 'pairo ka dard ki dawa' → 'medicine for leg pain'\n"
-        "   - 'shakkar ki ayurvedic dawa' → 'ayurvedic medicine for sugar'\n"
+        "   - 'sugar ki ayurvedic dawa' → 'ayurvedic medicine for sugar'\n"
         "   - 'pet dard ka ilaj' → 'treatment for stomach pain'\n"
         "   - 'baal jhadne ka upay' → 'remedy for hair fall'\n"
         "   - 'vajan kam karne ki dawa' → 'medicine for weight loss'\n"

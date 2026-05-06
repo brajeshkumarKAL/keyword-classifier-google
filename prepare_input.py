@@ -3,7 +3,8 @@ import pandas as pd
 from pathlib import Path
 
 def prepare_input(product_name: str):
-    raw_file = Path(f"{product_name}.xlsx")
+    raw_input_dir = Path("raw_input")
+    raw_file = raw_input_dir / f"{product_name}.xlsx"
     input_dir = Path("input")
     output_file = input_dir / "input_keywords.csv"
 
