@@ -63,9 +63,17 @@ NON_PURCHASE_TERMS = {
 }
 FORMAT_TERMS = {
     "oil", "tablet", "syrup", "tonic", "capsule", "choorna", "churna", 
-    "keram", "asava", "arishtam", "lehyam", "bhasma", "vati", "gutika", 
-    "kashayam", "kwath", "powder", "gel", "cream", "ointment", "spray", 
+    "keram", "tailam", "thailam", "asava", "arishtam", "lehyam", "bhasma", "vati", "gutika", 
+    "kashayam", "kwath", "powder", "gel", "cream", "soap", "ointment", "spray", 
     "drop", "drops", "juice"
+}
+FORMAT_CANONICAL_MAP = {
+    "keram": "oil",
+    "tailam": "oil",
+    "thailam": "oil",
+    "oil": "oil",
+    "choorna": "powder",
+    "churna": "powder",
 }
 SOLUTION_TERMS = {
     "medicine", "remedies", "remedy", "treatment", "solution", "care", 
@@ -103,6 +111,24 @@ USE_CASE_STOPWORDS = {
     "persistent",
     "continue",
     "episodes",
+}
+
+USE_CASE_LIGHT_STOPWORDS = {
+    "and",
+    "the",
+    "for",
+    "with",
+    "from",
+    "that",
+    "this",
+    "a",
+    "an",
+    "of",
+    "to",
+    "in",
+    "on",
+    "by",
+    "or",
 }
 
 SEVERITY_QUALITY_FILLER = {
@@ -419,7 +445,7 @@ def infer_product_format(product_name: str, use_case_text: str) -> str:
     joined = f"{product_name} {use_case_text}".lower()
     for fmt in FORMAT_TERMS:
         if fmt in joined:
-            return "oil" if fmt == "keram" else fmt
+            return FORMAT_CANONICAL_MAP.get(fmt, fmt)
     return "medicine"
 
 
@@ -856,6 +882,10 @@ def has_product_reference(keyword: str, context: ProductContext) -> bool:
     return False
 
 
+def canonicalize_format_token(token: str) -> str:
+    return FORMAT_CANONICAL_MAP.get(token, token)
+
+
 def is_competitor_product_keyword(keyword: str, context: ProductContext) -> bool:
     return has_competitor_term(keyword, context) and has_product_reference(keyword, context)
 
@@ -868,7 +898,8 @@ def extract_use_case_terms(context: ProductContext) -> set:
             context.key_benefits or "",
         ]
     )
-    source_tokens = normalize_keyword(source).split()
+    source_norm = normalize_keyword(source)
+    source_tokens = source_norm.split()
     product_tokens = set(normalize_keyword(context.product_name).split())
     blocked = USE_CASE_STOPWORDS | product_tokens | FORMAT_TERMS | {
         "kerala",
@@ -879,15 +910,36 @@ def extract_use_case_terms(context: ProductContext) -> set:
         "thailam",
         "choornam"
     }
-    terms = {t for t in source_tokens if len(t) >= 4 and t not in blocked}
+
+    # Token-level signals (keep meaningful condition/benefit words).
+    terms = {t for t in source_tokens if len(t) >= 3 and t not in blocked}
+
+    # Phrase-level signals from adjacent tokens to capture intent like "joint pain", "pain relief".
+    phrase_terms: set = set()
+    filtered_for_phrase = [
+        t for t in source_tokens
+        if len(t) >= 3 and t not in USE_CASE_LIGHT_STOPWORDS and t not in product_tokens
+    ]
+    for i in range(len(filtered_for_phrase) - 1):
+        phrase_terms.add(f"{filtered_for_phrase[i]} {filtered_for_phrase[i + 1]}")
+
+    terms.update(phrase_terms)
     return terms
 
 
 def has_use_case_alignment(keyword: str, use_case_terms: set) -> bool:
     if not use_case_terms:
         return False
-    kw_tokens = set(keyword.split())
-    return any(t in kw_tokens for t in use_case_terms)
+    kw_norm = normalize_keyword(keyword)
+    kw_tokens = set(kw_norm.split())
+
+    # Phrase-aware match first (for terms like "joint pain", "pain relief", "blood sugar").
+    for term in use_case_terms:
+        if " " in term and term in kw_norm:
+            return True
+
+    # Token fallback.
+    return any(t in kw_tokens for t in use_case_terms if " " not in t)
 
 
 def classify_intent_and_funnel(keyword: str) -> Tuple[str, str]:
@@ -925,8 +977,9 @@ def build_positive_note(keyword: str, intent: str, funnel_stage: str, ad_group: 
 
 
 def wrong_format(keyword: str, allowed_format: str) -> bool:
+    allowed_canonical = canonicalize_format_token(allowed_format)
     for fmt in FORMAT_TERMS:
-        if fmt in keyword and fmt != allowed_format:
+        if fmt in keyword and canonicalize_format_token(fmt) != allowed_canonical:
             return True
     return False
 
@@ -978,7 +1031,7 @@ def step_2_filter_keywords(df: pd.DataFrame, context: ProductContext) -> Tuple[L
             continue
             
         # Step E: Ambiguous / off-use-case filtering
-        has_product = normalize_keyword(context.product_name) in kw
+        has_product = has_product_reference(kw, context)
         has_commercial = contains_any(kw, TRANSACTIONAL_MODIFIERS | EVALUATION_MODIFIERS)
         has_condition_signal = "for " in kw and ("ayurvedic" in kw or "medicine" in kw or "remedy" in kw)
         aligned_use_case = has_use_case_alignment(kw, use_case_terms)
@@ -1001,9 +1054,8 @@ def step_2_filter_keywords(df: pd.DataFrame, context: ProductContext) -> Tuple[L
 
 
 def classify_ad_group(kw: str, context: ProductContext) -> Tuple[str, str]:
-    product_term = normalize_keyword(context.product_name)
     has_brand = "kerala ayurveda" in kw
-    has_product = product_term in kw
+    has_product = has_product_reference(kw, context)
     has_competitor = any(c in kw for c in context.competitors)
     has_tx = contains_any(kw, TRANSACTIONAL_MODIFIERS)
 
