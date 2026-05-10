@@ -23,6 +23,7 @@ OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
 
 TRANSACTIONAL_MODIFIERS = {"buy", "price", "online", "order", "shop", "purchase"}
 EVALUATION_MODIFIERS = {"best", "top", "review", "reviews", "compare", "comparison", "vs", "which"}
+HARD_INFORMATIONAL_NEGATIVE_TERMS = {"review", "reviews"}
 INFORMATIONAL_TERMS = {
     "benefits",
     "uses",
@@ -171,6 +172,7 @@ class ProductContext:
     competitors: List[str]
     allowed_format: str
     all_product_names: List[str]
+    product_aliases: List[str]
 
 
 @dataclass
@@ -449,6 +451,69 @@ def infer_product_format(product_name: str, use_case_text: str) -> str:
     return "medicine"
 
 
+def product_family_aliases(product_name: str, allowed_format: str) -> List[str]:
+    base = normalize_keyword(product_name)
+    if not base:
+        return []
+
+    aliases = {base, canonical_product_name(product_name)}
+    tokens = [t for t in base.split() if t]
+    if tokens:
+        aliases.add(" ".join(tokens))
+
+    # Build format-normalized family variants.
+    format_like = {"oil", "keram", "tailam", "thailam"}
+    core_tokens = [t for t in tokens if t not in format_like]
+    if core_tokens:
+        core_phrase = " ".join(core_tokens).strip()
+        if core_phrase:
+            aliases.add(core_phrase)
+            aliases.add(f"{core_phrase} oil")
+            aliases.add(f"{core_phrase} keram")
+            aliases.add(f"{core_phrase} thailam")
+            aliases.add(f"{core_phrase} tailam")
+
+    # Orthographic variants for common transliteration drift.
+    expanded = set(aliases)
+    for a in list(aliases):
+        if "bringadi" in a:
+            expanded.add(a.replace("bringadi", "bhringadi"))
+        if "bhringadi" in a:
+            expanded.add(a.replace("bhringadi", "bringadi"))
+
+    # Keep normalized, non-empty unique aliases only.
+    cleaned = []
+    seen = set()
+    for a in expanded:
+        n = normalize_keyword(a)
+        if not n or n in seen:
+            continue
+        seen.add(n)
+        cleaned.append(n)
+    return cleaned
+
+
+def has_product_alias_match(keyword: str, context: ProductContext) -> bool:
+    kw = normalize_keyword(keyword)
+    if not kw:
+        return False
+    kw_pad = f" {kw} "
+    for alias in context.product_aliases:
+        a = normalize_keyword(alias)
+        if not a:
+            continue
+        if f" {a} " in kw_pad:
+            return True
+    return False
+
+
+def has_probable_brand_context(keyword: str, context: ProductContext) -> bool:
+    kw = normalize_keyword(keyword)
+    if "kerala ayurveda" in kw:
+        return True
+    return "kerala" in kw and has_product_alias_match(kw, context)
+
+
 
 def parse_competitors(raw: str) -> List[str]:
     if not isinstance(raw, str):
@@ -539,6 +604,7 @@ def load_positioning_context(positioning_path: Path, product_name: str) -> Produ
     competitors = parse_competitors(row[competitor_col]) if competitor_col else []
 
     all_products = [normalize_keyword(str(v)) for v in df[product_col].dropna().astype(str).tolist()]
+    allowed_format = infer_product_format(pname, use_case)
     return ProductContext(
         product_name=pname,
         product_slug=slugify(pname),
@@ -548,8 +614,9 @@ def load_positioning_context(positioning_path: Path, product_name: str) -> Produ
         key_benefits=normalize_keyword(key_benefits),
         use_case_text=normalize_keyword(use_case),
         competitors=competitors,
-        allowed_format=infer_product_format(pname, use_case),
+        allowed_format=allowed_format,
         all_product_names=all_products,
+        product_aliases=product_family_aliases(pname, allowed_format),
     )
 
 
@@ -865,6 +932,8 @@ def has_competitor_term(keyword: str, context: ProductContext) -> bool:
 
 
 def has_product_reference(keyword: str, context: ProductContext) -> bool:
+    if has_product_alias_match(keyword, context):
+        return True
     own = normalize_keyword(context.product_name)
     if own in keyword:
         return True
@@ -942,12 +1011,21 @@ def has_use_case_alignment(keyword: str, use_case_terms: set) -> bool:
     return any(t in kw_tokens for t in use_case_terms if " " not in t)
 
 
-def classify_intent_and_funnel(keyword: str) -> Tuple[str, str]:
+def is_pack_or_variant_query(keyword: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(pack of \d+|\d+\s*pack|set of \d+|combo|combo pack|\d+\s*(ml|g|gm|kg|l|litre|liter))\b",
+            keyword,
+        )
+    )
+
+
+def classify_intent_and_funnel(keyword: str, context: ProductContext) -> Tuple[str, str]:
     kw = normalize_keyword(keyword)
     has_buy = contains_any(kw, {"buy", "order", "shop", "online", "purchase"}) or "where to buy" in kw
     has_eval = contains_any(kw, {"best", "top", "review", "reviews", "compare", "comparison", "vs", "which", "price", "cost", "mrp", "rate"})
     has_info = contains_any(kw, INFORMATIONAL_TERMS) or kw.startswith("what ") or kw.startswith("how ")
-    has_brand = "kerala ayurveda" in kw
+    has_brand = has_probable_brand_context(kw, context)
 
     if has_buy:
         return "Transactional", "BOF"
@@ -1005,28 +1083,28 @@ def step_2_filter_keywords(df: pd.DataFrame, context: ProductContext) -> Tuple[L
         # Step A: Marketplace filtering
         if contains_any(kw, MARKETPLACE_TERMS):
             removed.append(kw)
-            intent, funnel = classify_intent_and_funnel(kw)
+            intent, funnel = classify_intent_and_funnel(kw, context)
             negative.append({"Keyword": kw, "Fingerprint": fp, "Keyword Polarity": "Negative", "Intent Type": intent, "Funnel Stage": funnel, "Reason for Exclusion": "Marketplace term"})
             continue
             
         # Step B: Non-purchasing term filtering
         if contains_any(kw, NON_PURCHASE_TERMS):
             removed.append(kw)
-            intent, funnel = classify_intent_and_funnel(kw)
+            intent, funnel = classify_intent_and_funnel(kw, context)
             negative.append({"Keyword": kw, "Fingerprint": fp, "Keyword Polarity": "Negative", "Intent Type": intent, "Funnel Stage": funnel, "Reason for Exclusion": "Non-purchase behavioral query"})
             continue
             
         # Step C: Wrong format filtering
         if wrong_format(kw, context.allowed_format):
             removed.append(kw)
-            intent, funnel = classify_intent_and_funnel(kw)
+            intent, funnel = classify_intent_and_funnel(kw, context)
             negative.append({"Keyword": kw, "Fingerprint": fp, "Keyword Polarity": "Negative", "Intent Type": intent, "Funnel Stage": funnel, "Reason for Exclusion": "Wrong product format"})
             continue
             
         # Step D: Cross-Product leakage filtering
         if is_cross_product(kw, context):
             removed.append(kw)
-            intent, funnel = classify_intent_and_funnel(kw)
+            intent, funnel = classify_intent_and_funnel(kw, context)
             negative.append({"Keyword": kw, "Fingerprint": fp, "Keyword Polarity": "Negative", "Intent Type": intent, "Funnel Stage": funnel, "Reason for Exclusion": "Cross-product leakage"})
             continue
             
@@ -1043,7 +1121,7 @@ def step_2_filter_keywords(df: pd.DataFrame, context: ProductContext) -> Tuple[L
 
         if is_ambiguous:
             removed.append(kw)
-            intent, funnel = classify_intent_and_funnel(kw)
+            intent, funnel = classify_intent_and_funnel(kw, context)
             negative.append({"Keyword": kw, "Fingerprint": fp, "Keyword Polarity": "Negative", "Intent Type": intent, "Funnel Stage": funnel, "Reason for Exclusion": "Ambiguous/off-primary-use-case intent"})
             continue
             
@@ -1054,7 +1132,7 @@ def step_2_filter_keywords(df: pd.DataFrame, context: ProductContext) -> Tuple[L
 
 
 def classify_ad_group(kw: str, context: ProductContext) -> Tuple[str, str]:
-    has_brand = "kerala ayurveda" in kw
+    has_brand = has_probable_brand_context(kw, context)
     has_product = has_product_reference(kw, context)
     has_competitor = any(c in kw for c in context.competitors)
     has_tx = contains_any(kw, TRANSACTIONAL_MODIFIERS)
@@ -1140,6 +1218,7 @@ def step_3_classification(active_keywords: List[Tuple[str, str]], context: Produ
 
     rows: List[KeywordRecord] = []
     informational_negatives: List[Dict[str, str]] = []
+    use_case_terms = extract_use_case_terms(context)
     for kw in kw_list:
         picked = by_kw[kw]
         intent = str(picked.get("intent_type", "")).strip()
@@ -1156,7 +1235,27 @@ def step_3_classification(active_keywords: List[Tuple[str, str]], context: Produ
             
         has_buy_signal = contains_any(kw, TRANSACTIONAL_MODIFIERS | {"cost", "mrp", "rate"})
         has_info_signal = contains_any(kw, INFORMATIONAL_TERMS) or kw.startswith("what ") or kw.startswith("how ")
-        if has_info_signal and not has_buy_signal:
+        has_hard_info_negative = contains_any(kw, HARD_INFORMATIONAL_NEGATIVE_TERMS) or is_pack_or_variant_query(kw)
+        aligned_use_case = has_use_case_alignment(kw, use_case_terms)
+        has_category_signal = contains_any(kw, {"ayurvedic", "oil", context.allowed_format})
+        if has_info_signal:
+            intent = "Informational"
+            funnel_stage = "TOF"
+
+        # Use-case rescue: keep validated product use-case demand positive unless it's explicitly review/pack informational.
+        if (
+            intent == "Informational"
+            and not has_info_signal
+            and not has_hard_info_negative
+            and aligned_use_case
+            and has_category_signal
+            and not has_competitor_term(kw, context)
+        ):
+            intent = "Commercial"
+            funnel_stage = "MOF"
+            ad_group_base = "condition_search"
+
+        if has_hard_info_negative:
             intent = "Informational"
             funnel_stage = "TOF"
 
