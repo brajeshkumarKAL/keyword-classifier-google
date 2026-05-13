@@ -13,9 +13,9 @@ import pandas as pd
 from dotenv import load_dotenv
 from openai import OpenAI
 
-INPUT_KEYWORDS_CSV = Path("input/input_keywords.csv")
+INPUT_KEYWORDS_CSV = Path("input/input_search_terms.csv")
 POSITIONING_XLSX = Path("input/Test_Positioning document.xlsx")
-OUTPUT_DIR = Path("output")
+OUTPUT_DIR = Path("output/search_term_classified")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_MODEL = "openai/gpt-5-mini"
 OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
@@ -73,33 +73,8 @@ FORMAT_CANONICAL_MAP = {
     "tailam": "oil",
     "thailam": "oil",
     "oil": "oil",
-    "asava": "liquid",
-    "arishtam": "liquid",
-    "arishta": "liquid",
-    "syrup": "liquid",
-    "tonic": "liquid",
     "choorna": "powder",
     "churna": "powder",
-}
-FORMAT_FAMILY_MAP = {
-    "oil": "oil",
-    "liquid": "liquid",
-    "powder": "powder",
-    "tablet": "solid_oral",
-    "capsule": "solid_oral",
-    "gel": "topical",
-    "cream": "topical",
-    "ointment": "topical",
-    "spray": "topical",
-    "drop": "liquid",
-    "drops": "liquid",
-    "juice": "liquid",
-    "kashayam": "liquid",
-    "kwath": "liquid",
-    "lehyam": "semi_solid",
-    "bhasma": "powder",
-    "vati": "solid_oral",
-    "gutika": "solid_oral",
 }
 SOLUTION_TERMS = {
     "medicine", "remedies", "remedy", "treatment", "solution", "care", 
@@ -473,10 +448,6 @@ def infer_product_format(product_name: str, use_case_text: str) -> str:
     for fmt in FORMAT_TERMS:
         if fmt in joined:
             return FORMAT_CANONICAL_MAP.get(fmt, fmt)
-    # Name-derived fallback when positioning data does not explicitly include format terms.
-    name_norm = normalize_keyword(product_name)
-    if any(t in name_norm for t in {"asava", "arishta", "arishtam"}):
-        return "liquid"
     return "medicine"
 
 
@@ -491,23 +462,16 @@ def product_family_aliases(product_name: str, allowed_format: str) -> List[str]:
         aliases.add(" ".join(tokens))
 
     # Build format-normalized family variants.
-    format_like = {"oil", "keram", "tailam", "thailam", "syrup", "tonic", "asava", "arishta", "arishtam"}
+    format_like = {"oil", "keram", "tailam", "thailam"}
     core_tokens = [t for t in tokens if t not in format_like]
     if core_tokens:
         core_phrase = " ".join(core_tokens).strip()
         if core_phrase:
             aliases.add(core_phrase)
-            if format_family(allowed_format) == "liquid":
-                aliases.add(f"{core_phrase} syrup")
-                aliases.add(f"{core_phrase} tonic")
-                aliases.add(f"{core_phrase} asava")
-                aliases.add(f"{core_phrase} arishta")
-                aliases.add(f"{core_phrase} arishtam")
-            else:
-                aliases.add(f"{core_phrase} oil")
-                aliases.add(f"{core_phrase} keram")
-                aliases.add(f"{core_phrase} thailam")
-                aliases.add(f"{core_phrase} tailam")
+            aliases.add(f"{core_phrase} oil")
+            aliases.add(f"{core_phrase} keram")
+            aliases.add(f"{core_phrase} thailam")
+            aliases.add(f"{core_phrase} tailam")
 
     # Orthographic variants for common transliteration drift.
     expanded = set(aliases)
@@ -516,6 +480,23 @@ def product_family_aliases(product_name: str, allowed_format: str) -> List[str]:
             expanded.add(a.replace("bringadi", "bhringadi"))
         if "bhringadi" in a:
             expanded.add(a.replace("bhringadi", "bringadi"))
+        if "bhringraj" in a:
+            expanded.add(a.replace("bhringraj", "bhringraj"))
+            expanded.add(a.replace("bhringraj", "bhringaraj"))
+            expanded.add(a.replace("bhringraj", "bringaraj"))
+        if "bhringaraj" in a:
+            expanded.add(a.replace("bhringaraj", "bhringraj"))
+            expanded.add(a.replace("bhringaraj", "bringaraj"))
+        if "neeli" in a:
+            expanded.add(a.replace("neeli", "nili"))
+        if "tailam" in a:
+            expanded.add(a.replace("tailam", "thailam"))
+            expanded.add(a.replace("tailam", "tel"))
+        if "thailam" in a:
+            expanded.add(a.replace("thailam", "tailam"))
+            expanded.add(a.replace("thailam", "tel"))
+        if "oil" in a:
+            expanded.add(a.replace("oil", "tel"))
 
     # Keep normalized, non-empty unique aliases only.
     cleaned = []
@@ -540,6 +521,13 @@ def has_product_alias_match(keyword: str, context: ProductContext) -> bool:
             continue
         if f" {a} " in kw_pad:
             return True
+        # Rescue common misspellings/transliteration drift (token-level fuzzy).
+        a_tokens = [t for t in a.split() if len(t) >= 4]
+        kw_tokens = kw.split()
+        for at in a_tokens:
+            for kt in kw_tokens:
+                if difflib.SequenceMatcher(None, at, kt).ratio() >= 0.84:
+                    return True
     return False
 
 
@@ -690,20 +678,9 @@ def step_1_keyword_cleaning(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[Dict[s
     out["keyword"] = out["Keyword"].apply(normalize_keyword)
     out = out[out["keyword"] != ""]
 
-    # Identify only the duplicate rows that will actually be dropped (keep first as canonical)
-    duplicates_to_drop = out[out.duplicated(subset=["keyword"], keep="first")]
+    # Search-term workflow: remove duplicate-negativing behavior.
+    # Keep one canonical normalized row and do not emit duplicate negatives.
     duplicate_negatives: List[Dict[str, str]] = []
-    if not duplicates_to_drop.empty:
-        for _, row in duplicates_to_drop.iterrows():
-            duplicate_negatives.append({
-                "Keyword": row["keyword"],
-                "Fingerprint": "",
-                "Keyword Polarity": "Negative",
-                "Intent Type": "Informational",
-                "Funnel Stage": "TOF",
-                "Reason for Exclusion": "Duplicate after normalization",
-            })
-
     out = out.drop_duplicates(subset=["keyword"]).reset_index(drop=True)
     return out, duplicate_negatives
 
@@ -991,15 +968,6 @@ def canonicalize_format_token(token: str) -> str:
     return FORMAT_CANONICAL_MAP.get(token, token)
 
 
-def format_family(token: str) -> str:
-    canon = canonicalize_format_token(token)
-    return FORMAT_FAMILY_MAP.get(canon, canon)
-
-
-def is_format_compatible(keyword_format: str, allowed_format: str) -> bool:
-    return format_family(keyword_format) == format_family(allowed_format)
-
-
 def is_competitor_product_keyword(keyword: str, context: ProductContext) -> bool:
     return has_competitor_term(keyword, context) and has_product_reference(keyword, context)
 
@@ -1102,8 +1070,7 @@ def build_positive_note(keyword: str, intent: str, funnel_stage: str, ad_group: 
 def wrong_format(keyword: str, allowed_format: str) -> bool:
     allowed_canonical = canonicalize_format_token(allowed_format)
     for fmt in FORMAT_TERMS:
-        kw_fmt = canonicalize_format_token(fmt)
-        if fmt in keyword and not is_format_compatible(kw_fmt, allowed_canonical):
+        if fmt in keyword and canonicalize_format_token(fmt) != allowed_canonical:
             return True
     return False
 
@@ -1114,6 +1081,55 @@ def is_cross_product(keyword: str, context: ProductContext) -> bool:
         if pname and pname in keyword and pname != own:
             return True
     return False
+
+
+def has_product_family_signal(keyword: str) -> bool:
+    kw = normalize_keyword(keyword)
+    return contains_any(
+        kw,
+        {
+            "neeli",
+            "nili",
+            "nilibhringadi",
+            "neelibringadi",
+            "neelibhringadi",
+            "bhringadi",
+            "bringadi",
+            "bhringraj",
+            "bhringaraj",
+            "bringaraj",
+        },
+    )
+
+
+def is_off_product_oil_query(keyword: str, context: ProductContext) -> bool:
+    """
+    Guardrail for search-term flow:
+    If query is clearly about another oil family (rosemary/almond/etc.) and does not
+    reference our product family/brand, treat as off-product.
+    """
+    kw = normalize_keyword(keyword)
+    if not kw:
+        return False
+    if has_product_reference(kw, context):
+        return False
+    if has_product_family_signal(kw):
+        return False
+    off_oil_terms = {
+        "rosemary",
+        "almond",
+        "coconut",
+        "castor",
+        "argan",
+        "olive",
+        "onion oil",
+        "jojoba",
+        "sesame",
+        "mustard",
+        "lavender",
+    }
+    has_oil_context = contains_any(kw, {"oil", "tailam", "thailam", "tel", "keram"})
+    return has_oil_context and contains_any(kw, off_oil_terms)
 
 
 def step_2_filter_keywords(df: pd.DataFrame, context: ProductContext) -> Tuple[List[Tuple[str, str]], List[Dict[str, str]], List[str]]:
@@ -1153,16 +1169,40 @@ def step_2_filter_keywords(df: pd.DataFrame, context: ProductContext) -> Tuple[L
             intent, funnel = classify_intent_and_funnel(kw, context)
             negative.append({"Keyword": kw, "Fingerprint": fp, "Keyword Polarity": "Negative", "Intent Type": intent, "Funnel Stage": funnel, "Reason for Exclusion": "Cross-product leakage"})
             continue
+
+        # Step D2: Off-product oil guardrail (prevents rosemary/almond/etc. from being positive)
+        if is_off_product_oil_query(kw, context):
+            removed.append(kw)
+            intent, funnel = classify_intent_and_funnel(kw, context)
+            negative.append(
+                {
+                    "Keyword": kw,
+                    "Fingerprint": fp,
+                    "Keyword Polarity": "Negative",
+                    "Intent Type": intent,
+                    "Funnel Stage": funnel,
+                    "Reason for Exclusion": "Off-product oil family query",
+                }
+            )
+            continue
             
         # Step E: Ambiguous / off-use-case filtering
         has_product = has_product_reference(kw, context)
         has_commercial = contains_any(kw, TRANSACTIONAL_MODIFIERS | EVALUATION_MODIFIERS)
         has_condition_signal = "for " in kw and ("ayurvedic" in kw or "medicine" in kw or "remedy" in kw)
         aligned_use_case = has_use_case_alignment(kw, use_case_terms)
+        has_brand_signal = "kerala ayurveda" in kw or ("kerala" in kw and "ayurveda" in kw)
+        has_format_signal = contains_any(kw, {"oil", "tailam", "thailam", "tel", "keram"})
+        has_family_signal = has_product_family_signal(kw)
 
         is_ambiguous = False
         if not has_product and not has_competitor_term(kw, context):
-            if not (aligned_use_case and (has_commercial or has_condition_signal)) and not (aligned_use_case and len(kw.split()) >= 3):
+            variant_rescue = (has_family_signal and has_format_signal) or (has_brand_signal and has_family_signal)
+            if (
+                not variant_rescue
+                and not (aligned_use_case and (has_commercial or has_condition_signal))
+                and not (aligned_use_case and len(kw.split()) >= 3)
+            ):
                 is_ambiguous = True
 
         if is_ambiguous:
@@ -1185,6 +1225,10 @@ def classify_ad_group(kw: str, context: ProductContext) -> Tuple[str, str]:
 
     if has_competitor and has_tx:
         return "Transactional", f"competitor_search_{context.product_slug}"
+    # Deterministic override: product-family style queries should route to product_search,
+    # unless they are explicit brand+product navigational.
+    if has_product and has_product_family_signal(kw) and "kerala ayurveda" not in kw:
+        return "Transactional", f"product_search_{context.product_slug}"
     if has_brand and has_product:
         return "Navigational", f"brand_search_{context.product_slug}"
     if contains_any(kw, EVALUATION_MODIFIERS):
@@ -1315,6 +1359,11 @@ def step_3_classification(active_keywords: List[Tuple[str, str]], context: Produ
                 "Reason for Exclusion": "Informational intent from LLM/rule",
             })
             continue
+
+        # Deterministic ad-group correction after LLM:
+        # Keep explicit brand+product in brand ad group, but route plain product-family terms to product_search.
+        if has_product_reference(kw, context) and has_product_family_signal(kw) and "kerala ayurveda" not in kw:
+            ad_group_base = "product_search"
 
         ad_group = f"{ad_group_base}_{context.product_slug}"
         rows.append(
@@ -1586,6 +1635,9 @@ def process_product(
 
     print("[Progress] Step 1/9 Keyword cleaning")
     cleaned_df, cleaning_negatives = step_1_keyword_cleaning(raw_df)
+    # In search-term flow we dedupe normalized repeats without negativing duplicates.
+    # Reconciliation should therefore compare against cleaned unique search-term count.
+    total_input_count = len(cleaned_df)
 
     print("[Progress] Step 2/9 Filtering keywords")
     active, negative, _removed = step_2_filter_keywords(cleaned_df, context)
@@ -1641,7 +1693,7 @@ def process_product(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Kerala Ayurveda keyword cleaner and classifier")
+    parser = argparse.ArgumentParser(description="Kerala Ayurveda search-term cleaner and classifier")
     parser.add_argument("--product", required=True, help="Product name exactly as in positioning document")
     return parser
 

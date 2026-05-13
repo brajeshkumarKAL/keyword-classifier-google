@@ -92,6 +92,38 @@ python main.py --product "Myaxyl Oil"
 Output file will be created in `output/` as:
 - `output/<small_product_name>.xlsx` (example: `output/myaxyl.xlsx`)
 
+## Search-Term Pipeline (Manager Workflow)
+
+This flow keeps `main.py` unchanged and uses a cloned classifier (`main_search_terms.py`) for search terms.
+
+### Files
+- `prepare_search_terms_input.py`: creates `input/input_search_terms.csv` from raw search-term Excel.
+- `main_search_terms.py`: copied/adapted `main.py` classifier for search-term classification output.
+- `build_search_term_manager_outputs.py`: builds 3 manager-format files from classified search terms.
+- `search_term_pipeline.py`: end-to-end orchestrator for all steps.
+
+### One-command run
+
+```bash
+python search_term_pipeline.py --product "Neelibringadi Keram"
+```
+
+### Optional step-by-step run
+
+```bash
+python prepare_search_terms_input.py --product "Neelibringadi Keram"
+python main_search_terms.py --product "Neelibringadi Keram"
+python build_search_term_manager_outputs.py --product "Neelibringadi Keram"
+```
+
+### Outputs
+- Search-term classified workbook:
+  - `output/search_term_classified/<product_slug>.xlsx`
+- Manager files:
+  - `output/search_term_outputs/<product_slug>_positive_search_terms.xlsx`
+  - `output/search_term_outputs/<product_slug>_negative_search_terms.xlsx`
+  - `output/search_term_outputs/<product_slug>_negative_keywords.xlsx`
+
 ## Detailed Pipeline Walkthrough (`main.py`)
 
 Execution entrypoint: `process_product(...)`
