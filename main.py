@@ -5,9 +5,9 @@ import json
 import os
 import re
 import string
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -63,7 +63,7 @@ NON_PURCHASE_TERMS = {
     "naturopathy"
 }
 FORMAT_TERMS = {
-    "oil", "tablet", "syrup", "tonic", "capsule", "choorna", "churna", 
+    "oil", "tablet", "tablets", "pill", "pills", "syrup", "tonic", "capsule", "capsules", "choorna", "churna", 
     "keram", "tailam", "thailam", "asava", "arishtam", "lehyam", "bhasma", "vati", "gutika", 
     "kashayam", "kwath", "powder", "gel", "cream", "soap", "ointment", "spray", 
     "drop", "drops", "juice"
@@ -78,6 +78,10 @@ FORMAT_CANONICAL_MAP = {
     "arishta": "liquid",
     "syrup": "liquid",
     "tonic": "liquid",
+    "tablets": "tablet",
+    "pill": "tablet",
+    "pills": "tablet",
+    "capsules": "capsule",
     "choorna": "powder",
     "churna": "powder",
 }
@@ -87,6 +91,7 @@ FORMAT_FAMILY_MAP = {
     "powder": "powder",
     "tablet": "solid_oral",
     "capsule": "solid_oral",
+    "medicine": "solid_oral",
     "gel": "topical",
     "cream": "topical",
     "ointment": "topical",
@@ -196,8 +201,13 @@ class ProductContext:
     use_case_text: str
     competitors: List[str]
     allowed_format: str
+    allowed_format_families: Set[str]
     all_product_names: List[str]
     product_aliases: List[str]
+    brand_aliases: List[str] = field(default_factory=list)
+    semantic_use_case_terms: Set[str] = field(default_factory=set)
+    semantic_competitor_aliases: Set[str] = field(default_factory=set)
+    semantic_keyword_map: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -480,6 +490,17 @@ def infer_product_format(product_name: str, use_case_text: str) -> str:
     return "medicine"
 
 
+def infer_allowed_format_families(product_name: str, use_case_text: str, competitor_raw_text: str, allowed_format: str) -> Set[str]:
+    joined = normalize_keyword(f"{product_name} {use_case_text} {competitor_raw_text}")
+    families: Set[str] = set()
+    for term in FORMAT_TERMS:
+        if term in joined:
+            families.add(format_family(term))
+    families.add(format_family(allowed_format))
+    # Safety: if nothing concrete detected, keep inferred family only.
+    return {f for f in families if f}
+
+
 def product_family_aliases(product_name: str, allowed_format: str) -> List[str]:
     base = normalize_keyword(product_name)
     if not base:
@@ -547,6 +568,12 @@ def has_probable_brand_context(keyword: str, context: ProductContext) -> bool:
     kw = normalize_keyword(keyword)
     if "kerala ayurveda" in kw:
         return True
+    sem = context.semantic_keyword_map.get(kw, {})
+    if sem.get("brand_match") and float(sem.get("confidence", 0.0)) >= 0.75:
+        return True
+    for alias in context.brand_aliases:
+        if contains_term_phrase(kw, alias):
+            return True
     return "kerala" in kw and has_product_alias_match(kw, context)
 
 
@@ -601,6 +628,122 @@ def chat_json(client: OpenAI, model: str, system_prompt: str, user_prompt: str) 
         raise RuntimeError(f"LLM request failed: {exc}") from exc
 
 
+def build_semantic_context(context: ProductContext, llm_client: OpenAI, llm_model: str) -> None:
+    system_prompt = (
+        "You build robust semantic alias maps for Google Ads keyword classification.\n"
+        "Return strict JSON only with keys:\n"
+        "- product_aliases (array of strings)\n"
+        "- brand_aliases (array of strings)\n"
+        "- use_case_aliases (array of strings)\n"
+        "- competitor_aliases (array of strings)\n"
+        "- allowed_format_families (array of strings)\n"
+        "Rules:\n"
+        "1) Include spelling, spacing, and transliteration variants.\n"
+        "2) Keep aliases concise and lowercase-friendly.\n"
+        "3) Preserve meaning, do not invent unrelated terms.\n"
+        "4) Use India search-language patterns when appropriate."
+    )
+    user_prompt = (
+        f"Brand: Kerala Ayurveda\n"
+        f"Product: {context.product_name}\n"
+        f"Primary use case: {context.primary_use_case}\n"
+        f"Use case and benefits: {context.use_case_and_benefits}\n"
+        f"Key benefits: {context.key_benefits}\n"
+        f"Competitors: {', '.join(sorted(context.competitors)) if context.competitors else 'None'}\n"
+        f"Existing product aliases: {', '.join(sorted(context.product_aliases)) if context.product_aliases else 'None'}"
+    )
+    data = chat_json(llm_client, llm_model, system_prompt, user_prompt)
+    if not isinstance(data, dict):
+        return
+
+    def _norm_list(v: Any) -> List[str]:
+        if not isinstance(v, list):
+            return []
+        out: List[str] = []
+        seen = set()
+        for x in v:
+            n = normalize_keyword(str(x))
+            if n and n not in seen:
+                out.append(n)
+                seen.add(n)
+        return out
+
+    llm_product_aliases = _norm_list(data.get("product_aliases"))
+    llm_brand_aliases = _norm_list(data.get("brand_aliases"))
+    llm_use_case_aliases = _norm_list(data.get("use_case_aliases"))
+    llm_competitor_aliases = _norm_list(data.get("competitor_aliases"))
+    llm_allowed_families = _norm_list(data.get("allowed_format_families"))
+
+    context.product_aliases = list(dict.fromkeys(context.product_aliases + llm_product_aliases))
+    context.brand_aliases = list(dict.fromkeys(["kerala ayurveda", "kerala"] + llm_brand_aliases))
+    context.semantic_use_case_terms.update(llm_use_case_aliases)
+    context.semantic_competitor_aliases.update(llm_competitor_aliases)
+    for fam in llm_allowed_families:
+        context.allowed_format_families.add(fam)
+
+
+def build_semantic_keyword_matches(
+    keywords: List[str], context: ProductContext, llm_client: OpenAI, llm_model: str
+) -> None:
+    if not keywords:
+        return
+    batch_size = 30
+    system_prompt = (
+        "You detect semantic matches for Google Ads keywords.\n"
+        "Return strict JSON: {\"results\":[{...}]}\n"
+        "Each result must include:\n"
+        "- keyword\n"
+        "- product_match (boolean)\n"
+        "- brand_match (boolean)\n"
+        "- use_case_match (boolean)\n"
+        "- competitor_match (boolean)\n"
+        "- matched_use_cases (array of strings)\n"
+        "- confidence (number 0 to 1)\n"
+        "- format_families (array of strings)\n"
+        "Use semantic equivalence, spelling variants, and transliteration variants."
+    )
+
+    product_aliases = ", ".join(sorted(context.product_aliases)) if context.product_aliases else "None"
+    brand_aliases = ", ".join(sorted(context.brand_aliases)) if context.brand_aliases else "None"
+    use_cases = ", ".join(sorted(context.semantic_use_case_terms)) if context.semantic_use_case_terms else "None"
+    competitors = ", ".join(sorted(set(context.competitors) | context.semantic_competitor_aliases)) if (context.competitors or context.semantic_competitor_aliases) else "None"
+
+    for i in range(0, len(keywords), batch_size):
+        batch = keywords[i : i + batch_size]
+        user_prompt = (
+            f"Product: {context.product_name}\n"
+            f"Product aliases: {product_aliases}\n"
+            f"Brand aliases: {brand_aliases}\n"
+            f"Use-case aliases: {use_cases}\n"
+            f"Competitor aliases: {competitors}\n"
+            "Keywords:\n- " + "\n- ".join(batch)
+        )
+        data = chat_json(llm_client, llm_model, system_prompt, user_prompt)
+        if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+            continue
+        for item in data["results"]:
+            if not isinstance(item, dict):
+                continue
+            kw = normalize_keyword(str(item.get("keyword", "")))
+            if not kw:
+                continue
+            matched_use_cases = item.get("matched_use_cases", [])
+            if not isinstance(matched_use_cases, list):
+                matched_use_cases = []
+            format_families = item.get("format_families", [])
+            if not isinstance(format_families, list):
+                format_families = []
+            context.semantic_keyword_map[kw] = {
+                "product_match": bool(item.get("product_match", False)),
+                "brand_match": bool(item.get("brand_match", False)),
+                "use_case_match": bool(item.get("use_case_match", False)),
+                "competitor_match": bool(item.get("competitor_match", False)),
+                "matched_use_cases": [normalize_keyword(str(x)) for x in matched_use_cases if normalize_keyword(str(x))],
+                "format_families": [normalize_keyword(str(x)) for x in format_families if normalize_keyword(str(x))],
+                "confidence": float(item.get("confidence", 0.0) or 0.0),
+            }
+
+
 def load_positioning_context(positioning_path: Path, product_name: str) -> ProductContext:
     df = pd.read_excel(positioning_path, sheet_name=0)
     df.columns = [str(c).strip() for c in df.columns]
@@ -637,10 +780,12 @@ def load_positioning_context(positioning_path: Path, product_name: str) -> Produ
     use_case = " ".join(
         part for part in [primary_use_case, use_case_and_benefits, key_benefits] if part
     ).strip()
-    competitors = parse_competitors(row[competitor_col]) if competitor_col else []
+    competitor_raw = clean_cell_text(row[competitor_col]) if competitor_col else ""
+    competitors = parse_competitors(competitor_raw) if competitor_col else []
 
     all_products = [normalize_keyword(str(v)) for v in df[product_col].dropna().astype(str).tolist()]
     allowed_format = infer_product_format(pname, use_case)
+    allowed_families = infer_allowed_format_families(pname, use_case, competitor_raw, allowed_format)
     return ProductContext(
         product_name=pname,
         product_slug=slugify(pname),
@@ -651,8 +796,13 @@ def load_positioning_context(positioning_path: Path, product_name: str) -> Produ
         use_case_text=normalize_keyword(use_case),
         competitors=competitors,
         allowed_format=allowed_format,
+        allowed_format_families=allowed_families,
         all_product_names=all_products,
         product_aliases=product_family_aliases(pname, allowed_format),
+        brand_aliases=["kerala ayurveda", "kerala"],
+        semantic_use_case_terms=set(),
+        semantic_competitor_aliases=set(normalize_keyword(c) for c in competitors if normalize_keyword(c)),
+        semantic_keyword_map={},
     )
 
 
@@ -964,10 +1114,20 @@ def contains_term_phrase(text: str, term: str) -> bool:
 
 
 def has_competitor_term(keyword: str, context: ProductContext) -> bool:
-    return any(contains_term_phrase(keyword, c) for c in competitor_terms(context))
+    kw = normalize_keyword(keyword)
+    sem = context.semantic_keyword_map.get(kw, {})
+    if sem.get("competitor_match") and float(sem.get("confidence", 0.0)) >= 0.75:
+        return True
+    if any(contains_term_phrase(kw, c) for c in context.semantic_competitor_aliases):
+        return True
+    return any(contains_term_phrase(kw, c) for c in competitor_terms(context))
 
 
 def has_product_reference(keyword: str, context: ProductContext) -> bool:
+    kw = normalize_keyword(keyword)
+    sem = context.semantic_keyword_map.get(kw, {})
+    if sem.get("product_match") and float(sem.get("confidence", 0.0)) >= 0.75:
+        return True
     if has_product_alias_match(keyword, context):
         return True
     own = normalize_keyword(context.product_name)
@@ -998,6 +1158,30 @@ def format_family(token: str) -> str:
 
 def is_format_compatible(keyword_format: str, allowed_format: str) -> bool:
     return format_family(keyword_format) == format_family(allowed_format)
+
+
+def keyword_format_families(keyword: str, context: ProductContext) -> Set[str]:
+    kw = normalize_keyword(keyword)
+    families: Set[str] = set()
+    for fmt in FORMAT_TERMS:
+        if fmt in kw:
+            families.add(format_family(fmt))
+    sem = context.semantic_keyword_map.get(kw, {})
+    if float(sem.get("confidence", 0.0)) >= 0.70:
+        for fam in sem.get("format_families", []) or []:
+            n = normalize_keyword(str(fam))
+            if n:
+                families.add(n)
+    return families
+
+
+def is_keyword_format_compatible_for_rescue(keyword: str, context: ProductContext) -> bool:
+    allowed_families = set(context.allowed_format_families or {format_family(context.allowed_format)})
+    kw_families = keyword_format_families(keyword, context)
+    # If no explicit format family in the keyword, do not block rescue on format.
+    if not kw_families:
+        return True
+    return bool(kw_families & allowed_families)
 
 
 def is_competitor_product_keyword(keyword: str, context: ProductContext) -> bool:
@@ -1038,13 +1222,20 @@ def extract_use_case_terms(context: ProductContext) -> set:
         phrase_terms.add(f"{filtered_for_phrase[i]} {filtered_for_phrase[i + 1]}")
 
     terms.update(phrase_terms)
+    terms.update(set(normalize_keyword(t) for t in context.semantic_use_case_terms if normalize_keyword(t)))
     return terms
 
 
-def has_use_case_alignment(keyword: str, use_case_terms: set) -> bool:
+def has_use_case_alignment(keyword: str, use_case_terms: set, context: ProductContext) -> bool:
     if not use_case_terms:
-        return False
+        sem0 = context.semantic_keyword_map.get(normalize_keyword(keyword), {})
+        return bool(sem0.get("use_case_match") and float(sem0.get("confidence", 0.0)) >= 0.75)
     kw_norm = normalize_keyword(keyword)
+    sem = context.semantic_keyword_map.get(kw_norm, {})
+    if sem.get("use_case_match") and float(sem.get("confidence", 0.0)) >= 0.75:
+        return True
+    if any(contains_term_phrase(kw_norm, t) for t in context.semantic_use_case_terms):
+        return True
     kw_tokens = set(kw_norm.split())
 
     # Phrase-aware match first (for terms like "joint pain", "pain relief", "blood sugar").
@@ -1063,6 +1254,39 @@ def is_pack_or_variant_query(keyword: str) -> bool:
             keyword,
         )
     )
+
+
+def is_hard_informational_marker(keyword: str) -> bool:
+    kw = normalize_keyword(keyword)
+    hard_terms = {
+        "ingredients",
+        "ingredient",
+        "uses",
+        "use",
+        "side effects",
+        "side effect",
+        "benefits",
+        "before and after",
+        "meaning",
+        "definition",
+        "how to",
+        "what is",
+    }
+    return contains_any(kw, hard_terms)
+
+
+def has_actionable_for_use_case_intent(keyword: str, context: ProductContext, use_case_terms: set) -> bool:
+    kw = normalize_keyword(keyword)
+    if "for " not in kw:
+        return False
+    if is_hard_informational_marker(kw):
+        return False
+    if not has_product_reference(kw, context):
+        return False
+    sem = context.semantic_keyword_map.get(kw, {})
+    high_sem = float(sem.get("confidence", 0.0)) >= 0.75 and bool(sem.get("use_case_match"))
+    lexical_use_case = has_use_case_alignment(kw, use_case_terms, context)
+    return high_sem or lexical_use_case
 
 
 def classify_intent_and_funnel(keyword: str, context: ProductContext) -> Tuple[str, str]:
@@ -1099,13 +1323,14 @@ def build_positive_note(keyword: str, intent: str, funnel_stage: str, ad_group: 
     return f"Classified as {intent} at {funnel_stage}; routed to {ad_group}."
 
 
-def wrong_format(keyword: str, allowed_format: str) -> bool:
-    allowed_canonical = canonicalize_format_token(allowed_format)
-    for fmt in FORMAT_TERMS:
-        kw_fmt = canonicalize_format_token(fmt)
-        if fmt in keyword and not is_format_compatible(kw_fmt, allowed_canonical):
-            return True
-    return False
+def wrong_format(keyword: str, context: ProductContext) -> bool:
+    allowed_families = set(context.allowed_format_families or {format_family(context.allowed_format)})
+    kw_families = keyword_format_families(keyword, context)
+    if not kw_families:
+        return False
+    if kw_families & allowed_families:
+        return False
+    return True
 
 
 def is_cross_product(keyword: str, context: ProductContext) -> bool:
@@ -1141,11 +1366,18 @@ def step_2_filter_keywords(df: pd.DataFrame, context: ProductContext) -> Tuple[L
             continue
             
         # Step C: Wrong format filtering
-        if wrong_format(kw, context.allowed_format):
-            removed.append(kw)
-            intent, funnel = classify_intent_and_funnel(kw, context)
-            negative.append({"Keyword": kw, "Fingerprint": fp, "Keyword Polarity": "Negative", "Intent Type": intent, "Funnel Stage": funnel, "Reason for Exclusion": "Wrong product format"})
-            continue
+        if wrong_format(kw, context):
+            sem = context.semantic_keyword_map.get(kw, {})
+            # Do not hard-negative on format when semantic relevance is strong for competitor/use-case/product context.
+            if float(sem.get("confidence", 0.0)) >= 0.80 and (
+                sem.get("competitor_match") or sem.get("product_match") or sem.get("use_case_match")
+            ):
+                pass
+            else:
+                removed.append(kw)
+                intent, funnel = classify_intent_and_funnel(kw, context)
+                negative.append({"Keyword": kw, "Fingerprint": fp, "Keyword Polarity": "Negative", "Intent Type": intent, "Funnel Stage": funnel, "Reason for Exclusion": "Wrong product format"})
+                continue
             
         # Step D: Cross-Product leakage filtering
         if is_cross_product(kw, context):
@@ -1158,7 +1390,7 @@ def step_2_filter_keywords(df: pd.DataFrame, context: ProductContext) -> Tuple[L
         has_product = has_product_reference(kw, context)
         has_commercial = contains_any(kw, TRANSACTIONAL_MODIFIERS | EVALUATION_MODIFIERS)
         has_condition_signal = "for " in kw and ("ayurvedic" in kw or "medicine" in kw or "remedy" in kw)
-        aligned_use_case = has_use_case_alignment(kw, use_case_terms)
+        aligned_use_case = has_use_case_alignment(kw, use_case_terms, context)
 
         is_ambiguous = False
         if not has_product and not has_competitor_term(kw, context):
@@ -1282,20 +1514,36 @@ def step_3_classification(active_keywords: List[Tuple[str, str]], context: Produ
         has_buy_signal = contains_any(kw, TRANSACTIONAL_MODIFIERS | {"cost", "mrp", "rate"})
         has_info_signal = contains_any(kw, INFORMATIONAL_TERMS) or kw.startswith("what ") or kw.startswith("how ")
         has_hard_info_negative = contains_any(kw, HARD_INFORMATIONAL_NEGATIVE_TERMS) or is_pack_or_variant_query(kw)
-        aligned_use_case = has_use_case_alignment(kw, use_case_terms)
+        hard_info_marker = is_hard_informational_marker(kw)
+        aligned_use_case = has_use_case_alignment(kw, use_case_terms, context)
         has_category_signal = contains_any(kw, {"ayurvedic", "oil", context.allowed_format})
+        actionable_for_use_case = has_actionable_for_use_case_intent(kw, context, use_case_terms)
+        format_compatible_for_rescue = is_keyword_format_compatible_for_rescue(kw, context)
         if has_info_signal:
             intent = "Informational"
             funnel_stage = "TOF"
 
-        # Use-case rescue: keep validated product use-case demand positive unless it's explicitly review/pack informational.
+        # Generic actionable rescue for strong product + use-case intent like "product ... for <need>".
         if (
             intent == "Informational"
-            and not has_info_signal
+            and actionable_for_use_case
+            and not hard_info_marker
+            and not has_hard_info_negative
+            and format_compatible_for_rescue
+        ):
+            intent = "Commercial"
+            funnel_stage = "MOF"
+            ad_group_base = "condition_search"
+
+        # Use-case rescue: keep validated product use-case demand positive unless it's explicitly hard informational.
+        if (
+            intent == "Informational"
+            and not hard_info_marker
             and not has_hard_info_negative
             and aligned_use_case
             and has_category_signal
             and not has_competitor_term(kw, context)
+            and format_compatible_for_rescue
         ):
             intent = "Commercial"
             funnel_stage = "MOF"
@@ -1586,6 +1834,13 @@ def process_product(
 
     print("[Progress] Step 1/9 Keyword cleaning")
     cleaned_df, cleaning_negatives = step_1_keyword_cleaning(raw_df)
+
+    print("[Progress] Step 1.5/9 Semantic enrichment (safe fallback)")
+    try:
+        build_semantic_context(context, llm_client, llm_config.model)
+        build_semantic_keyword_matches(cleaned_df["keyword"].tolist(), context, llm_client, llm_config.model)
+    except Exception as exc:
+        print(f"[Progress] Step 1.5/9 Semantic enrichment skipped due to error: {exc}")
 
     print("[Progress] Step 2/9 Filtering keywords")
     active, negative, _removed = step_2_filter_keywords(cleaned_df, context)
